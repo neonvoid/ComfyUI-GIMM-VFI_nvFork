@@ -330,14 +330,20 @@ class nvGIMMVFI_interpolate_fps:
                     pbar.update(1)
                     continue
 
-                # Separate t=0 (use original frame) from interpolated frames
+                # Separate t≈0 and t≈1 (use original frames) from interpolated frames
+                # Use epsilon comparison to handle floating point precision issues
                 interp_entries = []
                 for out_idx, local_t in frame_entries:
-                    if local_t == 0.0:
-                        # Use original frame directly
+                    if local_t < 1e-6:
+                        # t≈0: Use I0 directly
                         out_images[out_idx] = I0.squeeze(0).permute(1, 2, 0).cpu()
+                    elif local_t > 1.0 - 1e-6:
+                        # t≈1: Use I2 directly (handles edge case where local_t >= 1.0)
+                        out_images[out_idx] = I2.squeeze(0).permute(1, 2, 0).cpu()
                     else:
-                        interp_entries.append((out_idx, local_t))
+                        # Clamp to safe range for interpolation
+                        clamped_t = max(1e-6, min(local_t, 1.0 - 1e-6))
+                        interp_entries.append((out_idx, clamped_t))
 
                 if not interp_entries:
                     pbar.update(1)
@@ -392,16 +398,34 @@ class nvGIMMVFI_interpolate_fps:
 
                 pbar.update(1)
 
-        # Handle the very last frame if it wasn't already placed
-        # This happens when the last output frame has t > 0 in the last pair
-        last_out_idx = output_frame_count - 1
-        if out_images[last_out_idx] is None:
-            # Use the last input frame
-            out_images[last_out_idx] = images[-1].permute(1, 2, 0).cpu()
+        # Safety check: fill any remaining None entries
+        # This handles edge cases from floating point calculations
+        for i in range(output_frame_count):
+            if out_images[i] is None:
+                # Find nearest input frame
+                source_pos = i * source_fps / target_fps
+                nearest_input = min(round(source_pos), input_frames - 1)
+                out_images[i] = images[nearest_input].permute(1, 2, 0).cpu()
+                log.warning(f"Frame {i} was None, filled with input frame {nearest_input}")
 
         # Stack all output images
         image_tensors = torch.stack(out_images)
         image_tensors = image_tensors.float()
+
+        # Check for NaN values and replace with nearest valid frame
+        if torch.isnan(image_tensors).any():
+            log.warning("NaN values detected in output, attempting to fix...")
+            nan_mask = torch.isnan(image_tensors).any(dim=-1).any(dim=-1).any(dim=-1)
+            nan_indices = torch.where(nan_mask)[0].tolist()
+            for idx in nan_indices:
+                # Find nearest non-NaN frame
+                for offset in range(1, output_frame_count):
+                    if idx - offset >= 0 and not torch.isnan(image_tensors[idx - offset]).any():
+                        image_tensors[idx] = image_tensors[idx - offset]
+                        break
+                    if idx + offset < output_frame_count and not torch.isnan(image_tensors[idx + offset]).any():
+                        image_tensors[idx] = image_tensors[idx + offset]
+                        break
 
         if output_flows and flows:
             rgb_images = [cv2.cvtColor(flow, cv2.COLOR_BGR2RGB) for flow in flows]
